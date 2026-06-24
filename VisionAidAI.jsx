@@ -322,19 +322,84 @@ function ScannerPage({ user, addScan, setPage, prefs }) {
 
   useEffect(() => () => stopCamera(), []);
 
+  const captureFrame = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    canvas.getContext("2d").drawImage(video, 0, 0);
+    return canvas.toDataURL("image/jpeg", 0.85).split(",")[1];
+  }, []);
+
+  const analyzeWithAI = useCallback(async (base64Image) => {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        system: `You are VisionAid AI, a vision assistant for blind and visually impaired users. 
+Analyze the image and respond ONLY with a JSON object (no markdown, no extra text) in this exact format:
+{
+  "type": "detected object name (e.g. Person, Dog, Chair, Mobile Phone)",
+  "emoji": "one relevant emoji",
+  "category": "Living or Non-Living",
+  "desc": "A clear 2-3 sentence description spoken to a blind person. Mention what it is, whether living/non-living, its purpose, and any safety info if needed.",
+  "warning": true or false (true only for medicines, sharp objects, fire, dangerous items)
+}
+Be accurate. If you see a person say Person. If you see a plant say Plant. Never guess randomly.`,
+        messages: [{
+          role: "user",
+          content: [{
+            type: "image",
+            source: { type: "base64", media_type: "image/jpeg", data: base64Image }
+          }, {
+            type: "text",
+            text: "What do you see in this image? Identify the main object or person accurately."
+          }]
+        }]
+      })
+    });
+    const data = await response.json();
+    const text = data.content?.[0]?.text || "{}";
+    const clean = text.replace(/```json|```/g, "").trim();
+    return JSON.parse(clean);
+  }, []);
+
   const handleScan = useCallback(async () => {
     if (!cameraActive && mode === "camera") { await startCamera(); return; }
-    setScanning(true); setResult(null);
-    await new Promise(r => setTimeout(r, 2200));
-    const scan = getRandomScan();
-    const voiceMsg = `Detected: ${scan.type}. ${scan.desc}`;
-    setResult({ ...scan, time: new Date(), voiceMsg });
+    setScanning(true); setResult(null); setError("");
+    try {
+      let base64 = null;
+      if (mode === "camera") {
+        await new Promise(r => setTimeout(r, 500));
+        base64 = captureFrame();
+        if (!base64) throw new Error("Could not capture image from camera.");
+      }
+      const aiResult = await analyzeWithAI(base64);
+      const scan = {
+        type: aiResult.type || "Unknown Object",
+        emoji: aiResult.emoji || "🔍",
+        category: aiResult.category || "Unknown",
+        desc: aiResult.desc || "Object detected. Unable to provide detailed description.",
+        warning: aiResult.warning || false,
+        key: aiResult.type?.toLowerCase().replace(/\s/g, "_") || "unknown",
+      };
+      const voiceMsg = scan.warning
+        ? `Warning! ${scan.type} detected. ${scan.desc}`
+        : `Detected: ${scan.type}. ${scan.desc}`;
+      setResult({ ...scan, time: new Date(), voiceMsg });
+      if (user) addScan({ ...scan, voiceMsg, time: new Date().toISOString() });
+      setSpeaking(true);
+      speak(voiceMsg, prefs.voiceSpeed || 1);
+      setTimeout(() => setSpeaking(false), 8000);
+    } catch (e) {
+      setError("Detection failed. Please try again with better lighting.");
+      speak("Detection failed. Please try again.", prefs.voiceSpeed || 1);
+    }
     setScanning(false);
-    if (user) addScan({ ...scan, voiceMsg, time: new Date().toISOString() });
-    setSpeaking(true);
-    speak(voiceMsg, prefs.voiceSpeed || 1);
-    setTimeout(() => setSpeaking(false), 5000);
-  }, [cameraActive, mode, startCamera, user, addScan, prefs]);
+  }, [cameraActive, mode, startCamera, captureFrame, analyzeWithAI, user, addScan, prefs]);
 
   const speakResult = () => { if (result) { setSpeaking(true); speak(result.voiceMsg, prefs.voiceSpeed || 1); setTimeout(() => setSpeaking(false), 5000); } };
 
@@ -390,7 +455,24 @@ function ScannerPage({ user, addScan, setPage, prefs }) {
               <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "#050a18" }}>
                 <div style={{ fontSize: 48, marginBottom: "1rem" }}>📁</div>
                 <p className="text-secondary" style={{ fontSize: 15 }}>Upload an image to scan</p>
-                <input type="file" accept="image/*" style={{ display: "none" }} id="img-upload" onChange={(e) => { if (e.target.files[0]) handleScan(); }} />
+                <input type="file" accept="image/*" style={{ display: "none" }} id="img-upload" onChange={async (e) => {
+                  const file = e.target.files[0]; if (!file) return;
+                  const reader = new FileReader();
+                  reader.onload = async (ev) => {
+                    const base64 = ev.target.result.split(",")[1];
+                    setScanning(true); setResult(null); setError("");
+                    try {
+                      const aiResult = await analyzeWithAI(base64);
+                      const scan = { type: aiResult.type || "Unknown", emoji: aiResult.emoji || "🔍", category: aiResult.category || "Unknown", desc: aiResult.desc || "Object detected.", warning: aiResult.warning || false, key: "upload" };
+                      const voiceMsg = scan.warning ? `Warning! ${scan.type} detected. ${scan.desc}` : `Detected: ${scan.type}. ${scan.desc}`;
+                      setResult({ ...scan, time: new Date(), voiceMsg });
+                      if (user) addScan({ ...scan, voiceMsg, time: new Date().toISOString() });
+                      setSpeaking(true); speak(voiceMsg, prefs.voiceSpeed || 1); setTimeout(() => setSpeaking(false), 8000);
+                    } catch { setError("Could not analyze image. Try again."); }
+                    setScanning(false);
+                  };
+                  reader.readAsDataURL(file);
+                }} />
                 <label htmlFor="img-upload" className="btn btn-outline mt-2" style={{ cursor: "pointer" }}>Choose Image</label>
               </div>
             )}
@@ -424,7 +506,7 @@ function ScannerPage({ user, addScan, setPage, prefs }) {
                   <div className="heading-md">{result.type}</div>
                   <div className="flex gap-1 mt-1">
                     <span className={`badge ${result.category === "Living" ? "badge-green" : "badge-blue"}`}>{result.category}</span>
-                    {result.key === "medicine" && <span className="badge badge-red">⚠ Warning</span>}
+                    {result.warning && <span className="badge badge-red">⚠ Warning</span>}
                   </div>
                 </div>
               </div>
